@@ -1,0 +1,18 @@
+﻿# secrets
+credentials.json
+token.json
+.env
+
+# caches / local data
+cache.sqlite
+cache.json
+*.db
+
+# python
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# streamlit
+.streamlit/
