@@ -1,10 +1,11 @@
 ﻿import os
+import re
 import streamlit as st
 from dotenv import load_dotenv
 
 from gmail_client import get_service, list_message_ids, get_message_metadata
 from storage import init_db, get_triage, upsert_triage
-from llm_triage import triage_emails, TOPICS
+from llm_triage import triage_emails
 
 load_dotenv()
 init_db()
@@ -18,7 +19,7 @@ if not api_ok:
 
 col1, col2, col3 = st.columns([1, 1, 2])
 with col1:
-    max_emails = st.slider("Emails to load", 20, 200, 80, 10)
+    max_emails = st.slider("Emails to load", 20, 300, 120, 10)
 with col2:
     model = st.selectbox("Model", ["deepseek-chat", "deepseek-reasoner"], index=0)
 with col3:
@@ -43,10 +44,21 @@ if not st.session_state.emails:
 emails = st.session_state.emails
 email_ids = [e["id"] for e in emails]
 
+# attach cached triage
 cached = get_triage(email_ids)
 for e in emails:
     e["triage"] = cached.get(e["id"])
 
+# existing topics for reuse (stability)
+existing_topics = []
+for e in emails:
+    tri = e.get("triage") or {}
+    t = (tri.get("topic") or "").strip()
+    if t:
+        existing_topics.append(t)
+existing_topics = sorted(list(dict.fromkeys(existing_topics)))
+
+# run triage for uncached
 to_triage = [e for e in emails if e.get("triage") is None]
 btn_label = f"Run AI triage ({len(to_triage)} new)"
 
@@ -55,35 +67,55 @@ if st.button(btn_label, disabled=(not api_ok or len(to_triage) == 0)):
     new_results = []
     for i in range(0, len(to_triage), BATCH):
         batch = to_triage[i:i+BATCH]
-        new_results.extend(triage_emails(batch, model=model))
+        new_results.extend(triage_emails(batch, model=model, existing_topics=existing_topics))
     upsert_triage(new_results)
 
     cached = get_triage(email_ids)
     for e in emails:
         e["triage"] = cached.get(e["id"])
 
-def topic_of(e):
-    t = (e.get("triage") or {}).get("topic")
-    return t if t in TOPICS else "Other"
+def norm_topic(t: str) -> str:
+    t = (t or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s&\-]", "", t)
+    return t[:28] if t else "Unsorted"
 
 urgent = [e for e in emails if (e.get("triage") or {}).get("is_urgent") is True]
 spam = [e for e in emails if (e.get("triage") or {}).get("is_spam") is True]
 
-topic_map = {t: [] for t in TOPICS}
-topic_map["Other"] = []
+topic_map = {}
 for e in emails:
-    topic_map[topic_of(e)].append(e)
+    tri = e.get("triage") or {}
+    t = norm_topic(tri.get("topic", "")) if tri else "Unsorted"
+    topic_map.setdefault(t, []).append(e)
+
+# sort topics by count desc, keep Unsorted last
+topics_sorted = sorted(topic_map.items(), key=lambda kv: (kv[0] == "Unsorted", -len(kv[1]), kv[0]))
 
 st.subheader("Dashboard")
 
-row = st.columns(6)
-if row[0].button(f"All ({len(emails)})"): st.session_state.bucket = "All"
-if row[1].button(f"Urgent ({len(urgent)})"): st.session_state.bucket = "Urgent"
-if row[2].button(f"Spam ({len(spam)})"): st.session_state.bucket = "Spam"
-if row[3].button(f"Project 1 ({len(topic_map.get('Project 1', []))})"): st.session_state.bucket = "Project 1"
-if row[4].button(f"University ({len(topic_map.get('University', []))})"): st.session_state.bucket = "University"
-if row[5].button(f"Other ({len(topic_map.get('Other', []))})"): st.session_state.bucket = "Other"
+top_row = st.columns(4)
+if top_row[0].button(f"All ({len(emails)})", key="bucket_all"):
+    st.session_state.bucket = "All"
+if top_row[1].button(f"Urgent ({len(urgent)})", key="bucket_urgent"):
+    st.session_state.bucket = "Urgent"
+if top_row[2].button(f"Spam ({len(spam)})", key="bucket_spam"):
+    st.session_state.bucket = "Spam"
+if top_row[3].button(f"Unsorted ({len(topic_map.get('Unsorted', []))})", key="bucket_unsorted"):
+    st.session_state.bucket = "Unsorted"
 
+# dynamic topic cards (top 18 as buttons)
+st.caption("Folders are created automatically from your inbox.")
+display_topics = [t for t, _ in topics_sorted if t not in ["Unsorted"]][:18]
+
+for i in range(0, len(display_topics), 6):
+    cols = st.columns(6)
+    for j, topic in enumerate(display_topics[i:i+6]):
+        count = len(topic_map.get(topic, []))
+        if cols[j].button(f"{topic} ({count})", key=f"topic_{topic}_{i+j}"):
+            st.session_state.bucket = topic
+
+# bucket selection
 bucket = st.session_state.bucket
 if bucket == "Urgent":
     filtered = urgent
@@ -102,8 +134,8 @@ with left:
         st.info("No emails in this bucket.")
         selected = None
     else:
-        options = [f"{e.get('subject','(no subject)')[:80]} | {e.get('from','')[:40]}" for e in filtered]
-        idx = st.selectbox("Select", range(len(filtered)), format_func=lambda i: options[i])
+        options = [f"{(e.get('subject') or '(no subject)')[:80]} | {(e.get('from') or '')[:40]}" for e in filtered]
+        idx = st.selectbox("Select", range(len(filtered)), format_func=lambda k: options[k])
         selected = filtered[idx]
 
 with right:
@@ -119,7 +151,7 @@ with right:
         tri = selected.get("triage") or {}
         st.markdown("---")
         if tri:
-            st.write("**Topic:**", tri.get("topic"))
+            st.write("**Folder:**", tri.get("topic"))
             st.write("**Urgent:**", tri.get("is_urgent"))
             st.write("**Spam:**", tri.get("is_spam"))
             st.write("**Action:**", tri.get("action"))
