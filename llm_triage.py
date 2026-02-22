@@ -1,4 +1,5 @@
-﻿import json
+﻿# llm_triage.py
+import json
 import re
 import os
 from typing import List, Dict, Any, Optional
@@ -20,7 +21,7 @@ def _norm_topic(t: str) -> str:
     t = (t or "").strip()
     t = re.sub(r"\s+", " ", t)
     t = re.sub(r"[^\w\s&\-]", "", t)
-    return t[:28]
+    return t[:28] if t else "Unsorted"
 
 def triage_emails(
     emails: List[dict],
@@ -38,24 +39,27 @@ def triage_emails(
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     existing_topics = [_norm_topic(x) for x in (existing_topics or []) if _norm_topic(x)]
-    existing_topics = sorted(list(dict.fromkeys(existing_topics)))[:40]
+    existing_topics = sorted(list(dict.fromkeys(existing_topics)))[:60]
 
     system = (
-        "You are an email classifier for an inbox dashboard.\n"
-        "Goal: assign each email to a stable folder (topic) that groups similar emails.\n\n"
-        "Return ONLY valid JSON. No extra text.\n"
+        "You classify emails into a stable mailbox label (mail type) that groups related emails.\n"
+        "Return ONLY valid JSON. No extra text.\n\n"
         "Schema: {\"items\": ["
-        "{\"id\": \"...\", \"topic\": \"...\", \"is_urgent\": true/false, \"is_spam\": true/false, "
-        "\"summary\": \"one short sentence\", \"action\": \"Reply|Read|Pay|Book|Follow-up|Ignore\", \"confidence\": 0.0-1.0}"
-        "]}\n\n"
+        "{\"id\":\"...\","
+        "\"topic\":\"...\","
+        "\"is_urgent\":true/false,"
+        "\"is_spam\":true/false,"
+        "\"summary\":\"one short sentence\","
+        "\"action\":\"Reply|Read|Pay|Book|Follow-up|Ignore\","
+        "\"confidence\":0.0-1.0"
+        "}]}.\n\n"
         "Topic rules:\n"
-        "- topic must be 1–3 words, <= 28 chars, no punctuation.\n"
-        "- Use organization/system names when possible (examples: DVSA, HMRC, Brighton, Bank, Amazon, Inditex, NHS).\n"
-        "- Reuse an existing topic if it matches.\n"
-        "- Do NOT create lots of near-duplicates. Prefer one stable label.\n"
-        f"Existing topics you MUST reuse when appropriate: {existing_topics}\n\n"
-        "Urgent: deadlines, payments due, account access issues, cancellations, time-sensitive actions.\n"
-        "Spam: scams, phishing, irrelevant promos/marketing.\n"
+        "- 1–3 words, <=28 chars.\n"
+        "- Use organization/system name when possible (DVSA, Devpost, NHS, HMRC, Bank, University, Amazon, Inditex).\n"
+        "- Reuse existing topics when appropriate to avoid duplicates.\n"
+        f"Existing topics to reuse when relevant: {existing_topics}\n\n"
+        "Urgent: deadlines, payments due, account/security issues, cancellations, time-sensitive actions.\n"
+        "Spam: scams, phishing, irrelevant promotions.\n"
         f"Allowed actions: {', '.join(ACTIONS)}.\n"
     )
 
@@ -74,11 +78,8 @@ def triage_emails(
     user = json.dumps({"emails": payload}, ensure_ascii=False)
 
     resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        model="deepseek-chat",  # forced
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         stream=False,
     )
 
@@ -92,7 +93,7 @@ def triage_emails(
         if not mid:
             continue
 
-        topic = _norm_topic(it.get("topic", "")) or "Unsorted"
+        topic = _norm_topic(it.get("topic", ""))
 
         action = it.get("action", "Read")
         if action not in ACTIONS:
