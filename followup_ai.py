@@ -5,7 +5,6 @@ import os
 from typing import List, Dict, Any
 from openai import OpenAI
 
-
 def _extract_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
@@ -15,7 +14,6 @@ def _extract_json(text: str) -> Dict[str, Any]:
     if not m:
         raise ValueError("No JSON found in model output.")
     return json.loads(m.group(0))
-
 
 def summarize_followups(topic_payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -27,22 +25,25 @@ def summarize_followups(topic_payloads: List[Dict[str, Any]]) -> List[Dict[str, 
 
     system = (
         "You produce a FOLLOW-UP dashboard from grouped emails.\n"
-        "Return ONLY valid JSON. No extra text.\n"
+        "Return ONLY valid JSON.\n"
         "Schema: {\"items\": ["
         "{\"topic\":\"DVSA\","
+        "\"include\":true/false,"
         "\"status\":\"Needs action|Waiting|Completed\","
         "\"status_detail\":\"3-7 words\","
         "\"last_update\":\"YYYY-MM-DD\","
         "\"next_step\":\"short action or None\","
         "\"priority\":1-5,"
         "\"accuracy\":0-100"
-        "}]}.\n"
+        "}]}.\n\n"
         "Rules:\n"
-        "- 'Needs action' only if user must do something.\n"
-        "- 'Waiting' if awaiting reply/processing.\n"
-        "- 'Completed' only if latest indicates done.\n"
-        "- priority 5 = most important.\n"
-        "- accuracy is your confidence 0-100.\n"
+        "- If the topic is mostly promotional/marketing/discount/newsletter, set include=false.\n"
+        "- Completion must be inferred primarily from the LATEST email in the group.\n"
+        "  Examples of Completed: payment confirmed, order complete, ticket confirmed, signed/approved, verification done.\n"
+        "- Needs action only if user must do something now.\n"
+        "- Waiting if awaiting response/processing.\n"
+        "- priority 5 highest.\n"
+        "- accuracy 0-100 is your confidence.\n"
     )
 
     user = json.dumps({"topics": topic_payloads}, ensure_ascii=False)
@@ -62,13 +63,15 @@ def summarize_followups(topic_payloads: List[Dict[str, Any]]) -> List[Dict[str, 
         if not topic:
             continue
 
+        include = bool(it.get("include", True))
+
         status = it.get("status", "Waiting")
         if status not in ["Needs action", "Waiting", "Completed"]:
             status = "Waiting"
 
         detail = (it.get("status_detail") or "").strip()[:60]
         last_update = (it.get("last_update") or "").strip()[:10]
-        next_step = (it.get("next_step") or "").strip()[:90]
+        next_step = (it.get("next_step") or "").strip()[:90] or "None"
 
         pr = it.get("priority", 3)
         try:
@@ -87,10 +90,11 @@ def summarize_followups(topic_payloads: List[Dict[str, Any]]) -> List[Dict[str, 
         cleaned.append(
             {
                 "topic": topic,
+                "include": include,
                 "status": status,
                 "status_detail": detail,
                 "last_update": last_update,
-                "next_step": next_step if next_step else "None",
+                "next_step": next_step,
                 "priority": pr,
                 "accuracy": acc,
             }

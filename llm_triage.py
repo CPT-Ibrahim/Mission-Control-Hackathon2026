@@ -55,11 +55,15 @@ def triage_emails(
         "}]}.\n\n"
         "Topic rules:\n"
         "- 1–3 words, <=28 chars.\n"
-        "- Use organization/system name when possible (DVSA, Devpost, NHS, HMRC, Bank, University, Amazon, Inditex).\n"
-        "- Reuse existing topics when appropriate to avoid duplicates.\n"
+        "- Prefer organization/system label: DVSA, Devpost, NHS, HMRC, Bank, University, Amazon, Inditex, Zoom.\n"
+        "- Reuse existing topics when appropriate.\n"
         f"Existing topics to reuse when relevant: {existing_topics}\n\n"
-        "Urgent: deadlines, payments due, account/security issues, cancellations, time-sensitive actions.\n"
-        "Spam: scams, phishing, irrelevant promotions.\n"
+        "CRITICAL rules for promotions:\n"
+        "- If it is a promotion/marketing/discount/offer/newsletter/sale (e.g., 'Last chance', 'OFF', '%', 'Deal', 'Save', 'Offer', 'Promo'),\n"
+        "  then set is_spam=true, is_urgent=false, action=Ignore.\n"
+        "- Promotions are NEVER urgent.\n\n"
+        "Urgent only for: deadlines, payments due, account/security issues, cancellations, time-sensitive actions.\n"
+        "Spam: scams/phishing/irrelevant promos/marketing.\n"
         f"Allowed actions: {', '.join(ACTIONS)}.\n"
     )
 
@@ -78,7 +82,7 @@ def triage_emails(
     user = json.dumps({"emails": payload}, ensure_ascii=False)
 
     resp = client.chat.completions.create(
-        model="deepseek-chat",  # forced
+        model="deepseek-chat",
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         stream=False,
     )

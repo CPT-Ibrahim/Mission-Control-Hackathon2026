@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 import streamlit as st
 from dotenv import load_dotenv
 
-from gmail_client import get_service, list_message_ids, get_message_metadata
+from gmail_client import get_service, list_message_ids, get_message_metadata, get_message_full
 from storage import (
     init_db,
     get_triage,
@@ -24,51 +24,50 @@ init_db()
 
 st.set_page_config(page_title="AI Gmail", layout="wide")
 
+# Auto refresh (poll) every 60s
+try:
+    st.autorefresh(interval=60_000, key="poll")
+except Exception:
+    pass
+
 st.markdown(
     """
 <style>
 h1 { display:none; }
 .header { font-size: 18px; font-weight: 800; margin: 4px 0 6px 0; }
-
 .stTextInput input { font-size: 18px; padding: 10px 14px; border-radius: 999px; }
 
-/* Make rows compact and left-aligned */
+/* compact clickable rows */
 div.stButton > button {
   border-radius: 10px;
   justify-content:flex-start !important;
   text-align:left !important;
-  padding: 4px 8px !important;
-  line-height: 1.1 !important;
+  padding: 3px 8px !important;
+  line-height: 1.05 !important;
 }
 
-/* Compact row */
-.row-summary { font-size: 0.84rem; opacity: 0.85; margin-top: 1px; }
+.row-summary { font-size: 0.82rem; opacity: 0.85; margin-top: 1px; }
 .row-badges { margin-top: 2px; }
+
 .badge {
   display:inline-block; padding:1px 7px; border-radius:999px;
   font-size:11px; margin-right:6px; margin-bottom:2px;
   border:1px solid rgba(255,255,255,0.16);
   background:rgba(255,255,255,0.02);
 }
-.badge-urgent { border-color: rgba(255,165,0,0.50); }
-.badge-spam   { border-color: rgba(255,70,70,0.50); }
+.badge-urgent { border-color: rgba(255,165,0,0.55); }
+.badge-spam   { border-color: rgba(255,70,70,0.55); }
 .badge-acc    { border-color: rgba(120,255,170,0.35); }
 
-.mail-date { opacity:0.75; font-size:0.80rem; text-align:right; white-space:nowrap; }
-.divline { border-bottom: 1px solid rgba(255,255,255,0.06); margin: 6px 0; }
+.mail-date { opacity:0.75; font-size:0.78rem; text-align:right; white-space:nowrap; }
+.divline { border-bottom: 1px solid rgba(255,255,255,0.06); margin: 5px 0; }
 
-/* Follow-up cards */
-.card {
-  border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 14px;
-  padding: 12px;
-  background: rgba(255,255,255,0.02);
-  margin-bottom: 10px;
-}
+/* follow-up cards */
+.card { border: 1px solid rgba(255,255,255,0.10); border-radius: 14px; padding: 12px;
+  background: rgba(255,255,255,0.02); margin-bottom: 10px; }
 .card-title { font-size: 16px; font-weight: 800; }
 .card-sub { font-size: 13px; opacity: 0.85; margin-top: 4px; }
 .card-meta { font-size: 12px; opacity: 0.75; margin-top: 8px; }
-
 .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid rgba(255,255,255,0.14); margin-right:6px; }
 .pill-action { border-color: rgba(255,165,0,0.55); }
 .pill-wait { border-color: rgba(120,170,255,0.45); }
@@ -96,10 +95,33 @@ if "spam_only" not in st.session_state:
 if "show_completed_cards" not in st.session_state:
     st.session_state.show_completed_cards = False
 if "active_topic" not in st.session_state:
-    st.session_state.active_topic = None  # set by dashboard "Show emails"
+    st.session_state.active_topic = None
+
+# inbox internal view
+if "inbox_view" not in st.session_state:
+    st.session_state.inbox_view = "list"  # list | detail
+if "opened_id" not in st.session_state:
+    st.session_state.opened_id = None
+if "full_cache" not in st.session_state:
+    st.session_state.full_cache = {}
 
 api_ok = bool(os.getenv("DEEPSEEK_API_KEY"))
 service = get_service()
+
+# ----------------------------
+# Heuristics to enforce promo->spam
+# ----------------------------
+PROMO_WORDS = [
+    "discount", "off", "%", "sale", "deal", "offer", "last chance", "save", "promo",
+    "newsletter", "limited time", "exclusive", "ends soon", "clearance", "buy 1", "bogo",
+    "free shipping", "voucher", "coupon"
+]
+
+def promo_like(subject: str, snippet: str) -> bool:
+    text = f"{subject} {snippet}".lower()
+    if re.search(r"\b\d{1,3}%\s*off\b", text):
+        return True
+    return any(w in text for w in PROMO_WORDS)
 
 # ----------------------------
 # Helpers
@@ -128,10 +150,6 @@ def format_date(date_str: str) -> str:
         return dt.strftime("%H:%M")
     return dt.strftime("%d %b")
 
-def refresh_emails():
-    ids = list_message_ids(service, max_results=st.session_state.max_emails)
-    st.session_state.emails = [get_message_metadata(service, mid) for mid in ids]
-
 def attach_triage():
     ids = [e["id"] for e in st.session_state.emails]
     cached = get_triage(ids)
@@ -155,31 +173,41 @@ def overall_accuracy(emails):
         return None
     return sum(vals) / len(vals)
 
-def is_urgent(e) -> bool:
-    return (e.get("triage") or {}).get("is_urgent") is True
-
 def is_spam(e) -> bool:
-    return (e.get("triage") or {}).get("is_spam") is True
+    tri = e.get("triage") or {}
+    subj = e.get("subject") or ""
+    snip = e.get("snippet") or ""
+    if promo_like(subj, snip):
+        return True
+    return tri.get("is_spam") is True
+
+def is_urgent(e) -> bool:
+    # promo can NEVER be urgent
+    tri = e.get("triage") or {}
+    subj = e.get("subject") or ""
+    snip = e.get("snippet") or ""
+    if promo_like(subj, snip):
+        return False
+    return tri.get("is_urgent") is True
 
 def needs_followup(e) -> bool:
     tri = e.get("triage") or {}
-    if tri.get("is_spam") is True:
+    if is_spam(e):
         return False
-    if tri.get("is_urgent") is True:
-        return True
+    # only real follow-up actions
     action = tri.get("action", "Read")
+    if is_urgent(e):
+        return True
     return action in ["Reply", "Pay", "Book", "Follow-up"]
 
 def extract_email_addr(from_field: str) -> str:
     m = re.search(r"<([^>]+)>", from_field or "")
     if m:
         return m.group(1).strip()
-    # fallback: find something that looks like an email
     m2 = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", from_field or "")
     return m2.group(0).strip() if m2 else ""
 
 def gmail_compose_link(to: str, subject: str, body: str) -> str:
-    # Opens Gmail compose window in browser
     return (
         "https://mail.google.com/mail/?view=cm&fs=1"
         f"&to={quote_plus(to)}"
@@ -187,12 +215,35 @@ def gmail_compose_link(to: str, subject: str, body: str) -> str:
         f"&body={quote_plus(body)}"
     )
 
+def auto_fetch_new_emails():
+    """
+    Poll Gmail. If new message IDs appear, fetch metadata only for the new ones and prepend.
+    """
+    ids = list_message_ids(service, max_results=st.session_state.max_emails)
+    if not ids:
+        return
+
+    existing_map = {e["id"]: e for e in st.session_state.emails}
+    if st.session_state.emails:
+        current_ids = [e["id"] for e in st.session_state.emails]
+        if ids == current_ids:
+            return
+
+    new_emails = []
+    for mid in ids:
+        if mid in existing_map:
+            new_emails.append(existing_map[mid])
+        else:
+            new_emails.append(get_message_metadata(service, mid))
+
+    st.session_state.emails = new_emails
+
 def auto_ai_run_new_only():
     """
     Runs AI ONLY for emails missing triage in cache.
-    This means: no email is processed twice.
+    Never processes the same email twice.
     """
-    if not api_ok:
+    if not api_ok or not st.session_state.emails:
         return
 
     attach_triage()
@@ -227,7 +278,6 @@ def build_dynamic_types(emails):
 def apply_filters(emails, q: str):
     out = emails
 
-    # if dashboard selected a topic, override type filter
     if st.session_state.active_topic:
         out = [e for e in out if mail_type(e) == st.session_state.active_topic]
     else:
@@ -237,7 +287,6 @@ def apply_filters(emails, q: str):
 
     if st.session_state.urgent_only:
         out = [e for e in out if is_urgent(e)]
-
     if st.session_state.spam_only:
         out = [e for e in out if is_spam(e)]
 
@@ -270,22 +319,31 @@ def badges_html(e):
     return " ".join(parts)
 
 def topic_signature(topic: str, topic_emails):
-    # signature changes when new follow-up emails appear
-    # use newest message id + count
     ids = [e["id"] for e in topic_emails]
     newest = ids[0] if ids else ""
     return f"{topic}:{newest}:{len(ids)}"
 
+def open_email_in_inbox(eid: str):
+    st.session_state.opened_id = eid
+    st.session_state.inbox_view = "detail"
+
+def get_full_body(eid: str) -> str:
+    if eid in st.session_state.full_cache:
+        return st.session_state.full_cache[eid]
+    full = get_message_full(service, eid)
+    body = (full.get("plain") or "").strip()
+    st.session_state.full_cache[eid] = body
+    return body
+
 # ----------------------------
-# Load + auto AI run (new only)
+# Poll + triage
 # ----------------------------
-if not st.session_state.emails:
-    refresh_emails()
+auto_fetch_new_emails()
 attach_triage()
 auto_ai_run_new_only()
 
 # ----------------------------
-# Header search
+# Header search + accuracy
 # ----------------------------
 search_text = st.text_input(
     "",
@@ -293,19 +351,15 @@ search_text = st.text_input(
     placeholder="Search mail (live)…",
     key="search_text",
 )
-
 acc = overall_accuracy(st.session_state.emails)
 acc_text = f"AI accuracy: {acc:.2f}%" if acc is not None else "AI accuracy: N/A"
 
 # ----------------------------
-# Sidebar (NO run AI buttons)
+# Sidebar (no refresh button)
 # ----------------------------
 with st.sidebar:
-    st.markdown("### Inbox")
-    if st.button("⟳ Refresh inbox"):
-        refresh_emails()
-        attach_triage()
-        auto_ai_run_new_only()
+    st.markdown("### Auto sync")
+    st.caption("Checks Gmail periodically.")
 
     st.session_state.max_emails = st.slider("Emails to load", 20, 800, st.session_state.max_emails, 10)
 
@@ -317,58 +371,83 @@ with st.sidebar:
         if st.button("Clear topic view"):
             st.session_state.active_topic = None
 
-    st.session_state.type_filter = st.multiselect("Mail types", options=types, default=st.session_state.type_filter, disabled=bool(st.session_state.active_topic))
+    st.session_state.type_filter = st.multiselect(
+        "Mail types",
+        options=types,
+        default=st.session_state.type_filter,
+        disabled=bool(st.session_state.active_topic),
+    )
 
     st.session_state.urgent_only = st.checkbox("Urgent only", value=st.session_state.urgent_only)
     st.session_state.spam_only = st.checkbox("Spam only", value=st.session_state.spam_only)
-
     st.session_state.show_completed_cards = st.checkbox("Show completed cards", value=st.session_state.show_completed_cards)
 
 # ----------------------------
-# Main layout: compact inbox + follow-up dashboard
+# Main layout
 # ----------------------------
 left, right = st.columns([2.2, 3.1], gap="large")
-
 filtered = apply_filters(st.session_state.emails, search_text)
 
 with left:
     st.caption(f"Showing {len(filtered)} of {len(st.session_state.emails)}  |  {acc_text}")
 
-    list_box = st.container(height=740, border=True)
-    with list_box:
-        if not filtered:
-            st.info("No emails match.")
-        else:
-            for e in filtered:
-                tri = e.get("triage") or {}
-                mt = mail_type(e) or "Unsorted"
-                subj = (e.get("subject") or "(no subject)").strip()
-                summary = (tri.get("summary") or e.get("snippet") or "").strip()
-
-                title = f"{mt} | {subj[:92]}"
-
-                c1, c2 = st.columns([4.8, 1.2])
-                with c1:
-                    st.button(title, key=f"row_{e['id']}", use_container_width=True)
-                    st.markdown(f"<div class='row-summary'>{summary[:160]}</div>", unsafe_allow_html=True)
-                    bh = badges_html(e)
+    box = st.container(height=740, border=True)
+    with box:
+        if st.session_state.inbox_view == "detail" and st.session_state.opened_id:
+            eid = st.session_state.opened_id
+            back = st.button("← Back", use_container_width=False)
+            if back:
+                st.session_state.inbox_view = "list"
+                st.session_state.opened_id = None
+            else:
+                selected = next((e for e in st.session_state.emails if e["id"] == eid), None)
+                if selected:
+                    tri = selected.get("triage") or {}
+                    st.write(f"**{mail_type(selected)} | {selected.get('subject','')}**")
+                    st.caption(selected.get("from",""))
+                    bh = badges_html(selected)
                     if bh:
-                        st.markdown(f"<div class='row-badges'>{bh}</div>", unsafe_allow_html=True)
-                with c2:
-                    st.markdown(f"<div class='mail-date'>{format_date(e.get('date',''))}</div>", unsafe_allow_html=True)
+                        st.markdown(bh, unsafe_allow_html=True)
+                    st.markdown("---")
+                    st.text_area("Full email", get_full_body(eid), height=560)
+                else:
+                    st.info("Email not found.")
+        else:
+            if not filtered:
+                st.info("No emails match.")
+            else:
+                for e in filtered:
+                    tri = e.get("triage") or {}
+                    mt = mail_type(e) or "Unsorted"
+                    subj = (e.get("subject") or "(no subject)").strip()
+                    summary = (tri.get("summary") or e.get("snippet") or "").strip()
 
-                st.markdown("<div class='divline'></div>", unsafe_allow_html=True)
+                    title = f"{mt} | {subj[:92]}"
+                    c1, c2 = st.columns([4.8, 1.2])
+                    with c1:
+                        if st.button(title, key=f"row_{e['id']}", use_container_width=True):
+                            open_email_in_inbox(e["id"])
+                        st.markdown(f"<div class='row-summary'>{summary[:150]}</div>", unsafe_allow_html=True)
+                        bh = badges_html(e)
+                        if bh:
+                            st.markdown(f"<div class='row-badges'>{bh}</div>", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"<div class='mail-date'>{format_date(e.get('date',''))}</div>", unsafe_allow_html=True)
+
+                    st.markdown("<div class='divline'></div>", unsafe_allow_html=True)
 
 with right:
     dash = st.container(height=740, border=True)
     with dash:
         st.subheader("Follow-up Dashboard")
 
-        # group follow-up emails by topic
+        # group ONLY real follow-up topics (exclude spam/promos)
         by_topic = {}
         for e in st.session_state.emails:
             tri = e.get("triage") or {}
-            if not tri or is_spam(e):
+            if not tri:
+                continue
+            if is_spam(e):
                 continue
             t = mail_type(e)
             if not t or t == "Unsorted":
@@ -376,8 +455,11 @@ with right:
             if needs_followup(e):
                 by_topic.setdefault(t, []).append(e)
 
+        # Enforce "continuous back and forth": require at least 2 emails in the topic
+        by_topic = {t: v for t, v in by_topic.items() if len(v) >= 2}
+
         if not by_topic:
-            st.info("No follow-up topics detected.")
+            st.info("No real follow-up threads detected.")
         else:
             # newest first per topic
             for t in list(by_topic.keys()):
@@ -390,7 +472,7 @@ with right:
             topics = list(by_topic.keys())
             cached_cards = get_followup(topics)
 
-            # Auto-generate missing or stale cards (NO BUTTONS)
+            # Auto-generate missing/stale cards
             to_build = []
             sig_map = {}
             for t in topics:
@@ -399,8 +481,6 @@ with right:
                 cached = cached_cards.get(t)
                 if not cached or cached.get("_signature") != sig:
                     to_build.append(t)
-
-            # limit rebuild per rerun to keep UI fast
             to_build = to_build[:8]
 
             if api_ok and to_build:
@@ -423,15 +503,21 @@ with right:
                             ],
                         }
                     )
-                with st.spinner("Updating follow-up dashboard..."):
+                with st.spinner("Updating dashboard..."):
                     cards = summarize_followups(payload)
+                # Keep only include=true
+                cards = [c for c in cards if c.get("include", True) is True]
                 upsert_followup(cards, signature_map=sig_map)
                 cached_cards = get_followup(topics)
 
-            # build render list
+            # Render
             cards_list = []
             for t in topics:
-                c = cached_cards.get(t) or {"topic": t, "status": "Waiting", "status_detail": "No status yet", "last_update": "", "next_step": "None", "priority": 2, "accuracy": 50, "_status": "open"}
+                c = cached_cards.get(t)
+                if not c:
+                    continue
+                if c.get("include", True) is False:
+                    continue
                 if (c.get("_status") == "complete") and (not st.session_state.show_completed_cards):
                     continue
                 cards_list.append(c)
@@ -459,10 +545,8 @@ with right:
                 elif status == "Completed":
                     pill = "pill-done"
 
-                box = cols[idx % 2]
-
-                # Card UI
-                box.markdown(
+                boxc = cols[idx % 2]
+                boxc.markdown(
                     f"""
 <div class="card">
   <div class="card-title">{topic}</div>
@@ -474,20 +558,17 @@ with right:
                     unsafe_allow_html=True,
                 )
 
-                # Card actions (requested)
-                a1, a2, a3 = box.columns(3)
+                a1, a2, a3 = boxc.columns(3)
 
-                # 1) Show related emails (filters left inbox)
                 if a1.button("Show emails", key=f"show_{topic}"):
                     st.session_state.active_topic = topic
+                    st.session_state.inbox_view = "list"
+                    st.session_state.opened_id = None
 
-                # 2) Mark complete (persist)
                 is_done = (c.get("_status") == "complete")
                 if a2.button("Complete" if not is_done else "Reopen", key=f"done_{topic}"):
                     set_followup_status(topic, "complete" if not is_done else "open")
 
-                # 3) Reply (opens Gmail compose with prefilled follow-up)
-                # Use latest email sender + Re: latest subject
                 latest = by_topic.get(topic, [None])[0]
                 if latest:
                     to_addr = extract_email_addr(latest.get("from", ""))
