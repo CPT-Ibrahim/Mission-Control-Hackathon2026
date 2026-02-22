@@ -1,5 +1,4 @@
-﻿# storage.py
-import json
+﻿import json
 import sqlite3
 from typing import Dict, Any, Iterable, List, Optional, Tuple
 
@@ -30,10 +29,10 @@ def init_db(db_path: str = DB_PATH) -> None:
         """
     )
 
-    # Backward compatible upgrades (if table existed earlier without columns)
-    for col, ddl in [
-        ("status", "ALTER TABLE followup ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"),
-        ("signature", "ALTER TABLE followup ADD COLUMN signature TEXT"),
+    # Backward compatible upgrades
+    for ddl in [
+        "ALTER TABLE followup ADD COLUMN status TEXT NOT NULL DEFAULT 'open'",
+        "ALTER TABLE followup ADD COLUMN signature TEXT",
     ]:
         try:
             cur.execute(ddl)
@@ -95,6 +94,7 @@ def get_followup(topics: Iterable[str], db_path: str = DB_PATH) -> Dict[str, Dic
 
     con = sqlite3.connect(db_path)
     cur = con.cursor()
+
     placeholders = ",".join(["?"] * len(tps))
     cur.execute(
         f"SELECT topic, result_json, status, signature FROM followup WHERE topic IN ({placeholders})",
@@ -115,7 +115,34 @@ def get_followup(topics: Iterable[str], db_path: str = DB_PATH) -> Dict[str, Dic
     return out
 
 
-def upsert_followup(results: List[Dict[str, Any]], signature_map: Optional[Dict[str, str]] = None, db_path: str = DB_PATH) -> None:
+def get_followup_all(status: Optional[str] = None, db_path: str = DB_PATH) -> Dict[str, Dict[str, Any]]:
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+
+    if status in ("open", "complete"):
+        cur.execute("SELECT topic, result_json, status, signature FROM followup WHERE status=?", (status,))
+    else:
+        cur.execute("SELECT topic, result_json, status, signature FROM followup")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for topic, rjson, stt, sig in cur.fetchall():
+        try:
+            data = json.loads(rjson)
+        except Exception:
+            data = {}
+        data["_status"] = stt
+        data["_signature"] = sig
+        out[topic] = data
+
+    con.close()
+    return out
+
+
+def upsert_followup(
+    results: List[Dict[str, Any]],
+    signature_map: Optional[Dict[str, str]] = None,
+    db_path: str = DB_PATH,
+) -> None:
     if not results:
         return
 
@@ -153,6 +180,16 @@ def set_followup_status(topic: str, status: str, db_path: str = DB_PATH) -> None
 
     con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.execute("UPDATE followup SET status=? WHERE topic=?", (status, topic))
+
+    # Ensure row exists so status is always persisted
+    cur.execute(
+        """
+        INSERT INTO followup (topic, result_json, status)
+        VALUES (?, ?, ?)
+        ON CONFLICT(topic) DO UPDATE SET status=excluded.status
+        """,
+        (topic, json.dumps({"topic": topic}, ensure_ascii=False), status),
+    )
+
     con.commit()
     con.close()
