@@ -1,6 +1,5 @@
-﻿import os
+import os
 import re
-import json
 import time
 import html
 from datetime import datetime, timezone
@@ -9,8 +8,8 @@ from urllib.parse import quote_plus
 
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
 
+from utils import get_deepseek_client, norm_topic
 from gmail_client import get_service, list_message_ids, get_message_metadata, get_message_full
 from storage import (
     init_db,
@@ -40,6 +39,8 @@ if "full_cache" not in st.session_state:
     st.session_state.full_cache = {}
 if "reply_cache" not in st.session_state:
     st.session_state.reply_cache = {}
+if "ai_response_cache" not in st.session_state:
+    st.session_state.ai_response_cache = {}
 
 if "emails" not in st.session_state:
     st.session_state.emails = []
@@ -63,8 +64,6 @@ if "show_completed_cards" not in st.session_state:
 # Sync + gating
 if "last_sync_ts" not in st.session_state:
     st.session_state.last_sync_ts = 0.0
-if "emails_digest" not in st.session_state:
-    st.session_state.emails_digest = ""
 if "dashboard_dirty" not in st.session_state:
     st.session_state.dashboard_dirty = True  # first run builds dashboard
 
@@ -79,7 +78,7 @@ if st.session_state.inbox_view == "list":
         pass
 
 # ----------------------------
-# Styling (keep your current look)
+# Styling
 # ----------------------------
 st.markdown(
     """
@@ -109,10 +108,15 @@ div.stButton > button p { text-align:left !important; width: 100% !important; ma
   background:rgba(255,255,255,0.02);
   white-space: nowrap;
 }
-.badge-urgent { border-color: rgba(255,165,0,0.55); }
-.badge-spam   { border-color: rgba(255,70,70,0.55); }
-.badge-ok     { border-color: rgba(120,255,170,0.35); }
-.badge-acc    { border-color: rgba(120,255,170,0.35); }
+.badge-urgent  { border-color: rgba(255,165,0,0.55); }
+.badge-spam    { border-color: rgba(255,70,70,0.55); }
+.badge-ok      { border-color: rgba(120,255,170,0.35); }
+.badge-acc     { border-color: rgba(120,255,170,0.35); }
+.badge-reply   { border-color: rgba(100,180,255,0.55); }
+.badge-pay     { border-color: rgba(255,100,100,0.55); }
+.badge-book    { border-color: rgba(180,130,255,0.55); }
+.badge-followup{ border-color: rgba(255,200,80,0.55); }
+.badge-pending { border-color: rgba(255,255,255,0.20); opacity: 0.5; }
 
 .card { border: 1px solid rgba(255,255,255,0.10); border-radius: 14px; padding: 12px;
   background: rgba(255,255,255,0.02); margin-bottom: 10px; }
@@ -152,12 +156,6 @@ def promo_like(subject: str, snippet: str) -> bool:
 # ----------------------------
 # Helpers
 # ----------------------------
-def norm_topic(t: str) -> str:
-    t = (t or "").strip()
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"[^\w\s&\-]", "", t)
-    return t[:28] if t else "Unsorted"
-
 def parse_date_safe(date_str: str):
     try:
         dt = parsedate_to_datetime(date_str)
@@ -188,13 +186,13 @@ def mail_type(e) -> str:
 
 def is_spam(e) -> bool:
     tri = e.get("triage") or {}
-    if promo_like(e.get("subject",""), e.get("snippet","")):
+    if promo_like(e.get("subject", ""), e.get("snippet", "")):
         return True
     return tri.get("is_spam") is True
 
 def is_urgent(e) -> bool:
     tri = e.get("triage") or {}
-    if promo_like(e.get("subject",""), e.get("snippet","")):
+    if promo_like(e.get("subject", ""), e.get("snippet", "")):
         return False
     return tri.get("is_urgent") is True
 
@@ -220,18 +218,38 @@ def conf_pct(e):
         return max(0.0, min(100.0, float(c) * 100.0))
     return None
 
+# FIX: was calling conf_pct(e) twice per email; use walrus operator instead
 def overall_accuracy(emails):
-    vals = [conf_pct(e) for e in emails if conf_pct(e) is not None]
+    vals = [v for e in emails if (v := conf_pct(e)) is not None]
     return (sum(vals) / len(vals)) if vals else None
 
 def status_badge_for_row(e) -> str:
+    """Return a badge for every email — no email is left unlabelled."""
+    # Not yet triaged by AI
+    if e.get("triage") is None:
+        return "<span class='badge badge-pending'>Pending</span>"
+
     if is_urgent(e):
         return "<span class='badge badge-urgent'>Urgent</span>"
     if is_spam(e):
         return "<span class='badge badge-spam'>Spam</span>"
     if no_action_needed(e):
         return "<span class='badge badge-ok'>No action</span>"
-    return ""
+
+    # Catch remaining action types: Reply, Pay, Book, Follow-up
+    action = (e.get("triage") or {}).get("action", "")
+    action_badges = {
+        "Reply":     ("badge-reply",    "Reply"),
+        "Pay":       ("badge-pay",      "Pay"),
+        "Book":      ("badge-book",     "Book"),
+        "Follow-up": ("badge-followup", "Follow-up"),
+    }
+    if action in action_badges:
+        css, label = action_badges[action]
+        return f"<span class='badge {css}'>{label}</span>"
+
+    # Absolute fallback — should never reach here
+    return "<span class='badge badge-ok'>Read</span>"
 
 def get_full_body(eid: str) -> str:
     if eid in st.session_state.full_cache:
@@ -301,7 +319,7 @@ def auto_ai_run_new_only() -> bool:
     BATCH = 25
     results = []
     for i in range(0, len(target), BATCH):
-        results.extend(triage_emails(target[i:i+BATCH], model="deepseek-chat", existing_topics=existing))
+        results.extend(triage_emails(target[i:i + BATCH], model="deepseek-chat", existing_topics=existing))
 
     upsert_triage(results)
     attach_triage()
@@ -349,7 +367,11 @@ def apply_inbox_filters(emails, q: str):
             return qq in blob
         out = [e for e in out if match(e)]
 
-    out = sorted(out, key=lambda e: (parse_date_safe(e.get("date","")) or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    out = sorted(
+        out,
+        key=lambda e: (parse_date_safe(e.get("date", "")) or datetime.min.replace(tzinfo=timezone.utc)),
+        reverse=True,
+    )
     return out
 
 def topic_signature(topic: str, topic_emails):
@@ -357,12 +379,15 @@ def topic_signature(topic: str, topic_emails):
     newest = ids[0] if ids else ""
     return f"{topic}:{newest}:{len(ids)}"
 
+# FIX: single top-level version — the weaker duplicate inside the render block is removed
 def extract_email_addr(from_field: str) -> str:
     m = re.search(r"<([^>]+)>", from_field or "")
-    if m: return m.group(1).strip()
+    if m:
+        return m.group(1).strip()
     m2 = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", from_field or "")
     return m2.group(0).strip() if m2 else ""
 
+# FIX: single top-level version — the duplicate inside the render block is removed
 def gmail_compose_link(to: str, subject: str, body: str) -> str:
     return (
         "https://mail.google.com/mail/?view=cm&fs=1"
@@ -370,6 +395,43 @@ def gmail_compose_link(to: str, subject: str, body: str) -> str:
         f"&su={quote_plus(subject)}"
         f"&body={quote_plus(body)}"
     )
+
+def cb_generate_reply(mid: str) -> None:
+    """Draft an AI reply for the given message id and store it in reply_cache."""
+    email_obj = next((e for e in st.session_state.emails if e["id"] == mid), None)
+    if not email_obj:
+        raise ValueError(f"Email {mid} not found in session.")
+
+    body = get_full_body(mid)
+    tri = email_obj.get("triage") or {}
+
+    client = get_deepseek_client()
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional email assistant. "
+                    "Draft a clear, concise reply to the email below. "
+                    "Match the tone of the original. "
+                    "Output only the reply body — no subject line, no 'Subject:', no preamble."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"From: {email_obj.get('from', '')}\n"
+                    f"Subject: {email_obj.get('subject', '')}\n"
+                    f"AI summary: {tri.get('summary', '')}\n\n"
+                    f"Email body:\n{body[:3000]}"
+                ),
+            },
+        ],
+        stream=False,
+    )
+    draft = (resp.choices[0].message.content or "").strip()
+    st.session_state.reply_cache[mid] = draft
 
 # ----------------------------
 # Initial load
@@ -385,19 +447,15 @@ if not st.session_state.emails:
 changed = auto_fetch_new_emails()
 triaged = auto_ai_run_new_only()
 
-ids_now = [e["id"] for e in st.session_state.emails]
-digest = f"{len(ids_now)}:{ids_now[0] if ids_now else ''}:{ids_now[-1] if ids_now else ''}"
-if digest != st.session_state.emails_digest:
-    st.session_state.emails_digest = digest
-    st.session_state.dashboard_dirty = True
-
+# FIX: removed redundant emails_digest block — initial load and changed/triaged flags
+# already cover all cases where dashboard_dirty should be set to True
 if changed or triaged:
     st.session_state.dashboard_dirty = True
 
 # ----------------------------
 # Header search
 # ----------------------------
-search_text = st.text_input("", value=st.session_state.get("search_text",""), placeholder="Search mail (live)…", key="search_text")
+search_text = st.text_input("", value=st.session_state.get("search_text", ""), placeholder="Search mail (live)…", key="search_text")
 
 # ----------------------------
 # Sidebar widgets FIRST (fix one-click lag)
@@ -411,6 +469,7 @@ with st.sidebar:
         st.session_state.emails = []
         st.session_state.full_cache = {}
         st.session_state.reply_cache = {}
+        st.session_state.ai_response_cache = {}
         st.session_state.inbox_view = "list"
         st.session_state.opened_id = None
         st.session_state.dashboard_dirty = True
@@ -468,40 +527,33 @@ with left:
                 st.info("Email not found.")
             else:
                 tri = selected.get("triage") or {}
-                st.markdown(f"<div class='detail-top'>{mail_type(selected)} | {selected.get('subject','')}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='detail-from'>{selected.get('from','')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='detail-top'>{mail_type(selected)} | {selected.get('subject', '')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='detail-from'>{selected.get('from', '')}</div>", unsafe_allow_html=True)
 
                 # Detail indicators (includes accuracy)
                 badges = []
-                if is_urgent(selected): badges.append("<span class='badge badge-urgent'>Urgent</span>")
-                if is_spam(selected): badges.append("<span class='badge badge-spam'>Spam</span>")
-                if no_action_needed(selected): badges.append("<span class='badge badge-ok'>No action</span>")
+                if is_urgent(selected):
+                    badges.append("<span class='badge badge-urgent'>Urgent</span>")
+                if is_spam(selected):
+                    badges.append("<span class='badge badge-spam'>Spam</span>")
+                if no_action_needed(selected):
+                    badges.append("<span class='badge badge-ok'>No action</span>")
                 c = conf_pct(selected)
-                if c is not None: badges.append(f"<span class='badge badge-acc'>Accuracy {c:.1f}%</span>")
+                if c is not None:
+                    badges.append(f"<span class='badge badge-acc'>Accuracy {c:.1f}%</span>")
                 if badges:
                     st.markdown(" ".join(badges), unsafe_allow_html=True)
 
-                st.markdown(f"<div class='detail-mini'><b>AI:</b> {tri.get('summary','(no summary yet)')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='detail-mini'><b>AI:</b> {tri.get('summary', '(no summary yet)')}</div>", unsafe_allow_html=True)
 
                 # --- Reply + Generate AI response (side-by-side) ---
-                import re
-                from urllib.parse import quote
-
-                def _extract_email_addr(text: str) -> str:
-                    if not text:
-                        return ""
-                    m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
-                    return m.group(0) if m else ""
-
-                def _gmail_compose_link(to: str, subject: str, body: str) -> str:
-                    base = "https://mail.google.com/mail/?view=cm&fs=1"
-                    return f"{base}&to={quote(to)}&su={quote(subject)}&body={quote(body)}"
-
+                # FIX: removed duplicate inner imports and function definitions;
+                # use the top-level extract_email_addr and gmail_compose_link instead
                 sender = selected.get("from", "") or ""
                 subject = selected.get("subject", "") or ""
-                to_addr = _extract_email_addr(sender)
+                to_addr = extract_email_addr(sender)
                 subj = f"Re: {subject}" if subject else "Re:"
-                reply_link = _gmail_compose_link(to_addr, subj, "")
+                reply_link = gmail_compose_link(to_addr, subj, "")
 
                 b1, b2 = st.columns([1, 1], gap="small")
 
@@ -511,15 +563,11 @@ with left:
                 else:
                     b1.markdown(f"[Reply]({reply_link})")
 
-                # AI response cache (only shows between info + full body when generated)
-                if "ai_response_cache" not in st.session_state:
-                    st.session_state.ai_response_cache = {}
-                if "reply_cache" not in st.session_state:
-                    st.session_state.reply_cache = {}
-
+                # FIX: removed redundant session state inits here — both are already
+                # initialised at the top of the file on every boot
                 def cb_generate_ai_response(mid: str):
                     try:
-                        cb_generate_reply(mid)  # expected to fill st.session_state.reply_cache[mid]
+                        cb_generate_reply(mid)
                         st.session_state.ai_response_cache[mid] = st.session_state.reply_cache.get(mid, "")
                     except Exception as ex:
                         st.session_state.ai_response_cache[mid] = f"(Could not generate AI response: {ex})"
@@ -534,8 +582,9 @@ with left:
                     st.markdown("**AI generated response**")
                     st.text_area("", ai_text, height=140, label_visibility="collapsed")
 
-                    # Optional: open Gmail compose prefilled with the AI text
-                    link2 = _gmail_compose_link(to_addr, subj, ai_text)
+                    # Open Gmail compose prefilled with the AI draft
+                    # FIX: was calling the now-removed inner _gmail_compose_link; uses top-level instead
+                    link2 = gmail_compose_link(to_addr, subj, ai_text)
                     if hasattr(st, "link_button"):
                         st.link_button("Open AI response in Gmail compose", link2, use_container_width=True)
                     else:
@@ -572,7 +621,7 @@ with left:
                         if badge:
                             st.markdown(badge, unsafe_allow_html=True)
                     with c3:
-                        st.markdown(f"<div class='mail-date'>{format_date(e.get('date',''))}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='mail-date'>{format_date(e.get('date', ''))}</div>", unsafe_allow_html=True)
 
                     st.markdown("<div class='divline'></div>", unsafe_allow_html=True)
 
@@ -602,14 +651,14 @@ with right:
         for t in topics:
             by_topic[t] = sorted(
                 by_topic[t],
-                key=lambda e: (parse_date_safe(e.get("date","")) or datetime.min.replace(tzinfo=timezone.utc)),
+                key=lambda e: (parse_date_safe(e.get("date", "")) or datetime.min.replace(tzinfo=timezone.utc)),
                 reverse=True,
             )
 
         # Pull cached cards (fast)
         cached_cards = get_followup(topics) if topics else {}
 
-        # NEW RULE: dashboard AI updates only when dashboard_dirty AND list view
+        # Dashboard AI updates only when dashboard_dirty AND list view
         if (st.session_state.inbox_view == "list") and api_ok and st.session_state.dashboard_dirty and topics:
             to_build = []
             sig_map = {}
@@ -667,7 +716,7 @@ with right:
                 continue
             cards_list.append(c)
 
-        # Add completed cards even if not currently in by_topic (optional)
+        # Add completed cards even if not currently in by_topic
         if st.session_state.show_completed_cards:
             for t, c in completed_extra.items():
                 if t in topics:

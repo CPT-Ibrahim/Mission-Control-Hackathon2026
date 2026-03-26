@@ -1,44 +1,45 @@
-﻿# topic_summary.py
-import json
-import os
+"""
+topic_summary.py — summarises a single email thread into bullet points.
+
+Used in the detail view to give the user a quick overview of a thread
+without having to read every email in it.
+"""
+
 from typing import List, Dict
-from openai import OpenAI
+from utils import get_deepseek_client
+
+# Module-level client — created once, reused on every call
+_client = get_deepseek_client()
+
 
 def summarize_topic(topic: str, items: List[Dict], model: str = "deepseek-chat") -> str:
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY missing in .env")
-
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
-    payload = []
-    for e in items[:12]:
-        tri = e.get("triage") or {}
-        payload.append(
-            {
-                "date": e.get("date", ""),
-                "from": e.get("from", ""),
-                "subject": e.get("subject", ""),
-                "summary": tri.get("summary", ""),
-                "action": tri.get("action", ""),
-                "urgent": tri.get("is_urgent", False),
-            }
-        )
+    """
+    Given a topic name and its emails, return a plain-text bullet summary.
+    Covers: current situation, latest update, next actions, deadlines, who to contact.
+    """
+    payload = [
+        {
+            "date": e.get("date", ""),
+            "from": e.get("from", ""),
+            "subject": e.get("subject", ""),
+            "summary": (e.get("triage") or {}).get("summary", ""),
+            "action": (e.get("triage") or {}).get("action", ""),
+            "urgent": (e.get("triage") or {}).get("is_urgent", False),
+        }
+        for e in items[:12]
+    ]
 
     system = (
-        "Summarize this topic for a dashboard. "
+        "Summarise this email thread for a dashboard. "
         "Return plain text bullet points only (max 6). "
-        "Include: current situation, latest update, next actions, deadlines/risks, who to contact."
+        "Cover: current situation, latest update, next actions, deadlines/risks, who to contact."
     )
 
-    user = json.dumps({"topic": topic, "emails": payload}, ensure_ascii=False)
-
-    resp = client.chat.completions.create(
+    resp = _client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": str({"topic": topic, "emails": payload})},
         ],
         stream=False,
     )
